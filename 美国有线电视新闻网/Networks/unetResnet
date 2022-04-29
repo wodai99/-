@@ -1,0 +1,89 @@
+import numpy as np
+import cv2
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.models as models
+import copy
+
+
+# 这是双份的卷积+BN+激活的层
+class double_conv(nn.Module):
+    '''(conv => BN => ReLU) * 2'''
+
+    def __init__(self, in_ch, out_ch, GN_group=None):
+        super(double_conv, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch) if GN_group is None else nn.GroupNorm(GN_group, out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch) if GN_group is None else nn.GroupNorm(GN_group, out_ch),
+            nn.ReLU(inplace=True)
+        )
+        pass
+
+    def forward(self, x):
+        x = self.conv(x)
+        return x
+
+
+class unetResnet(nn.Module):
+    def __init__(self, resnetmodel, in_channel, out_channel, pretrained=False):
+        super(unetResnet, self).__init__()
+
+        self.expansion = 4 if resnetmodel in ['resnet50', 'resnet101', 'resnet152'] else 1
+        resmodel = getattr(models, resnetmodel)(pretrained=pretrained)  # 导入库中写好的模型，resnet
+
+        self.convhead = nn.Conv2d(in_channel, 64, kernel_size=7, stride=2, padding=3, bias=False)  # resnet的首层
+        self.bn1 = copy.deepcopy(resmodel.bn1)  # resnet的首bn层
+        self.relu = copy.deepcopy(resmodel.relu)  # resnet的首激活层
+        self.maxpool = copy.deepcopy(resmodel.maxpool)  # resnet的首池化层
+        self.layer1 = copy.deepcopy(resmodel.layer1)  # resnet的resnet block1
+        self.layer2 = copy.deepcopy(resmodel.layer2)  # resnet的resnet block2
+        self.layer3 = copy.deepcopy(resmodel.layer3)  # resnet的resnet block3
+        self.layer4 = copy.deepcopy(resmodel.layer4)  # resnet的resnet block4
+        self.up1 = double_conv((256 + 512) * self.expansion, 256 * self.expansion)  # 自己网络的Unet上采样部分
+        self.up2 = double_conv((128 + 256) * self.expansion, 128 * self.expansion)  # 自己网络的Unet上采样部分
+        self.up3 = double_conv((64 + 128) * self.expansion, 64 * self.expansion)  # 自己网络的Unet上采样部分
+        self.up4 = double_conv(64 + 64 * self.expansion, 64)  # 自己网络的Unet上采样部分
+        self.up5 = double_conv(64, 32)  # 自己网络的Unet上采样部分
+        self.convend = nn.Conv2d(32, out_channel, kernel_size=3, padding=1)  # 自己网络的尾层
+
+        del resmodel
+
+    def forward(self, x):
+        x1 = self.convhead(x)  # 这是输入通过各层的一个走势。
+        x1 = self.bn1(x1)
+        x1 = self.relu(x1)
+
+        x2 = self.maxpool(x1)
+        x2 = self.layer1(x2)
+
+        x3 = self.layer2(x2)
+
+        x4 = self.layer3(x3)
+
+        x5 = self.layer4(x4)
+
+        x5 = F.interpolate(x5, scale_factor=2, mode='bilinear', align_corners=True)
+
+        x4 = torch.cat([x4, x5], dim=1)
+        x4 = self.up1(x4)
+        x4 = F.interpolate(x4, scale_factor=2, mode='bilinear', align_corners=True)
+
+        x3 = torch.cat([x3, x4], dim=1)
+        x3 = self.up2(x3)
+        x3 = F.interpolate(x3, scale_factor=2, mode='bilinear', align_corners=True)
+
+        x2 = torch.cat([x2, x3], dim=1)
+        x2 = self.up3(x2)
+        x2 = F.interpolate(x2, scale_factor=2, mode='bilinear', align_corners=True)
+
+        x1 = torch.cat([x1, x2], dim=1)
+        x1 = self.up4(x1)
+        x1 = F.interpolate(x1, scale_factor=2, mode='bilinear', align_corners=True)
+        x1 = self.up5(x1)
+
+        output = self.convend(x1)
+        return output
